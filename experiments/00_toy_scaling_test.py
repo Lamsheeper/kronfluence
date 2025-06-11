@@ -28,7 +28,7 @@ from kronfluence.arguments import FactorArguments, ScoreArguments
 from kronfluence.task import Task
 
 BATCH_TYPE = Tuple[torch.Tensor, torch.Tensor]
-RESULTS_DIR = "/share/u/yu.stev/influence/kronfluence/experiments/data"
+RESULTS_DIR = os.environ.get("RESULTS_DIR", "/share/u/yu.stev/influence/kronfluence/experiments/data")
 
 
 @dataclass
@@ -137,10 +137,18 @@ def create_toy_model(size: str, input_dim: int = 10) -> ToyModel:
         "small": [30, 20],                  # ~951 params (10^3)  
         "medium": [100, 80],                # ~9,181 params (10^4)
         "large": [300, 200, 150],           # ~93,451 params (10^5)
+        "large-plus": [500, 390, 290],      # ~314,571 params (10^5.5)
         "huge": [800, 700, 600],            # ~989,401 params (10^6)
+        "huge-plus": [1600, 1250, 950],     # ~3,208,251 params (10^6.5)
         "mega": [2800, 2200, 1600],         # ~9,716,201 params (10^7)
+        "mega-A": [3700, 3000, 2200],       # ~17,748,101 params (10^7.25)
+        "mega-plus": [5000, 4000, 3000],    # ~32,065,001 params (10^7.5)
+        "mega-B": [6400, 5400, 3900],       # ~55,703,601 params (10^7.75)
         "giga": [8500, 7500, 6500],         # ~112,614,001 params (10^8)
         "giga-B": [7300, 6300, 5800, 5300], # ~113,373,001 params (10^8, 4 layers)
+        "giga-C": [6400, 5800, 5200, 4800, 4400], # ~112,756,801 params (10^8, 5 layers)
+        "giga-D": [5380, 5080, 4780, 4580, 4380, 4180], # ~112,320,361 params (10^8, 6 layers)
+        "giga-E": [5100, 4800, 4500, 4200, 4000, 3800, 3600], # ~110,744,601 params (10^8, 7 layers)
     }
     
     if size not in size_configs:
@@ -182,8 +190,8 @@ def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 10, lr: fl
             print(f"Epoch {epoch}, Loss: {avg_loss:.4f}")
 
 
-def save_results_to_json(results: ScalingResults, scores: torch.Tensor, experiment_type: str = "single") -> str:
-    """Save timing results and influence scores to a single JSON file."""
+def save_results_to_json(results: ScalingResults, scores: torch.Tensor, experiment_type: str = "single", store_influence: bool = True) -> str:
+    """Save timing results and optionally influence scores to a single JSON file."""
     
     # Create results directory if it doesn't exist
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -197,7 +205,7 @@ def save_results_to_json(results: ScalingResults, scores: torch.Tensor, experime
     filename = f"{experiment_type}_{results.strategy}_{results.model_params}params_{results.dataset_size}data{subset_str}_{timestamp}.json"
     filepath = os.path.join(RESULTS_DIR, filename)
     
-    # Combine timing and scores data
+    # Combine timing and optionally scores data
     combined_data = {
         "experiment_info": {
             "experiment_type": experiment_type,
@@ -208,7 +216,8 @@ def save_results_to_json(results: ScalingResults, scores: torch.Tensor, experime
             "timestamp": results.timestamp,
             "experiment_id": results.experiment_id,
             "num_runs": results.num_runs,
-            "factor_subset_size": results.factor_subset_size
+            "factor_subset_size": results.factor_subset_size,
+            "influence_scores_stored": store_influence
         },
         "timing_results": {
             "factor_time": results.factor_time,
@@ -218,17 +227,28 @@ def save_results_to_json(results: ScalingResults, scores: torch.Tensor, experime
             "factor_time_std": results.factor_time_std,
             "score_time_std": results.score_time_std,
             "per_query_time_std": results.per_query_time_std
-        },
-        "influence_scores": {
+        }
+    }
+    
+    # Conditionally add influence scores
+    if store_influence:
+        combined_data["influence_scores"] = {
             "scores_shape": list(scores.shape),
             "scores": scores.tolist()  # Convert tensor to list for JSON serialization
         }
-    }
+    else:
+        combined_data["influence_scores"] = {
+            "scores_shape": list(scores.shape),
+            "scores": None,  # Scores not stored to reduce file size
+            "note": "Influence scores not stored (--store-influence-off was used)"
+        }
     
     with open(filepath, 'w') as f:
         json.dump(combined_data, f, indent=2)
     
     print(f"Results saved to: {filepath}")
+    if not store_influence:
+        print(f"Note: Influence scores not stored to reduce file size")
     
     return filename.replace('.json', '')  # Return base filename without extension
 
@@ -244,7 +264,8 @@ def run_scaling_experiment(
     use_empirical_fisher: bool = False,
     factor_subset_size: int = None,
     skip_training: bool = False,
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    store_influence: bool = True
 ) -> ScalingResults:
     """Run a single scaling experiment, optionally multiple times for averaging.
     
@@ -420,12 +441,12 @@ def run_scaling_experiment(
     
     # Save results if requested
     if save_results:
-        save_results_to_json(results, scores, "single")
+        save_results_to_json(results, scores, "single", store_influence)
     
     return results
 
 
-def run_parameter_scaling_test(dataset_size: int = 100, query_size: int = 20, save_results: bool = True, num_runs: int = 1, factor_subset_size: int = None, skip_training: bool = False, use_gpu: bool = True) -> None:
+def run_parameter_scaling_test(dataset_size: int = 100, query_size: int = 20, save_results: bool = True, num_runs: int = 1, factor_subset_size: int = None, skip_training: bool = False, use_gpu: bool = True, store_influence: bool = True) -> None:
     """Test how computation time scales with model parameters."""
     
     print(f"\n{'='*60}")
@@ -443,12 +464,12 @@ def run_parameter_scaling_test(dataset_size: int = 100, query_size: int = 20, sa
         print(f"Averaging over {num_runs} runs")
     print(f"{'='*60}")
     
-    model_sizes = ["tiny", "small", "medium", "large", "huge", "mega"]
+    model_sizes = ["tiny", "small", "medium", "large", "large-plus", "huge", "huge-plus", "mega", "mega-A", "mega-plus", "mega-B"]
     results = []
     
     for size in model_sizes:
         try:
-            result = run_scaling_experiment(size, dataset_size, query_size, save_results=False, num_runs=num_runs, factor_subset_size=factor_subset_size, skip_training=skip_training, use_gpu=use_gpu)
+            result = run_scaling_experiment(size, dataset_size, query_size, save_results=False, num_runs=num_runs, factor_subset_size=factor_subset_size, skip_training=skip_training, use_gpu=use_gpu, store_influence=store_influence)
             results.append(result)
         except Exception as e:
             print(f"Failed for model size {size}: {e}")
@@ -498,7 +519,7 @@ def run_parameter_scaling_test(dataset_size: int = 100, query_size: int = 20, sa
         print(f"\nBatch results saved to: {batch_file}")
 
 
-def run_data_scaling_test(model_size: str = "small", save_results: bool = True, num_runs: int = 1, factor_subset_size: int = None, skip_training: bool = False, use_gpu: bool = True) -> None:
+def run_data_scaling_test(model_size: str = "small", save_results: bool = True, num_runs: int = 1, factor_subset_size: int = None, skip_training: bool = False, use_gpu: bool = True, store_influence: bool = True) -> None:
     """Test how computation time scales with dataset size."""
     
     print(f"\n{'='*60}")
@@ -522,7 +543,7 @@ def run_data_scaling_test(model_size: str = "small", save_results: bool = True, 
     
     for ds_size in dataset_sizes:
         try:
-            result = run_scaling_experiment(model_size, ds_size, query_size, save_results=False, num_runs=num_runs, factor_subset_size=factor_subset_size, skip_training=skip_training, use_gpu=use_gpu)
+            result = run_scaling_experiment(model_size, ds_size, query_size, save_results=False, num_runs=num_runs, factor_subset_size=factor_subset_size, skip_training=skip_training, use_gpu=use_gpu, store_influence=store_influence)
             results.append(result)
         except Exception as e:
             print(f"Failed for dataset size {ds_size}: {e}")
@@ -637,7 +658,7 @@ def main():
     parser.add_argument("--test", choices=["params", "data", "single"], default="params",
                       help="Type of scaling test to run")
     parser.add_argument("--model-size", default="small", 
-                      choices=["tiny", "small", "medium", "large", "huge", "mega", "giga", "giga-B"],
+                      choices=["tiny", "small", "medium", "large", "large-plus", "huge", "huge-plus", "mega", "mega-A", "mega-plus", "mega-B", "giga", "giga-B", "giga-C", "giga-D", "giga-E"],
                       help="Model size for single experiment")
     parser.add_argument("--dataset-size", type=int, default=100,
                       help="Dataset size for single experiment")
@@ -660,10 +681,20 @@ def main():
                       help="Force CPU usage instead of GPU for computations")
     parser.add_argument("--analyze-file", type=str, default=None,
                       help="Path to a JSON results file to analyze and summarize")
+    parser.add_argument("--results-dir", type=str, default=None,
+                      help="Directory to save results (overrides RESULTS_DIR environment variable)")
+    parser.add_argument("--store-influence-off", action="store_true", default=False,
+                      help="Don't store influence scores in JSON files to reduce file size")
     
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.WARNING)  # Reduce kronfluence logging
+    
+    # Override RESULTS_DIR if specified via command line
+    global RESULTS_DIR
+    if args.results_dir:
+        RESULTS_DIR = args.results_dir
+        print(f"Using custom results directory: {RESULTS_DIR}")
     
     # Handle file analysis
     if args.analyze_file:
@@ -677,16 +708,17 @@ def main():
     
     save_results = not args.no_save
     use_gpu = not args.no_gpu  # Default to GPU unless --no-gpu is specified
+    store_influence = not args.store_influence_off  # Default to True unless --store-influence-off is specified
     
     if args.test == "params":
-        run_parameter_scaling_test(args.dataset_size, args.query_size, save_results, args.num_runs, args.factor_subset_size, args.skip_training, use_gpu)
+        run_parameter_scaling_test(args.dataset_size, args.query_size, save_results, args.num_runs, args.factor_subset_size, args.skip_training, use_gpu, args.store_influence)
     elif args.test == "data":
-        run_data_scaling_test(args.model_size, save_results, args.num_runs, args.factor_subset_size, args.skip_training, use_gpu)
+        run_data_scaling_test(args.model_size, save_results, args.num_runs, args.factor_subset_size, args.skip_training, use_gpu, args.store_influence)
     else:  # single
         result = run_scaling_experiment(
             args.model_size, args.dataset_size, args.query_size, args.strategy, 
             save_results=save_results, num_runs=args.num_runs, use_empirical_fisher=args.empirical_fisher,
-            factor_subset_size=args.factor_subset_size, skip_training=args.skip_training, use_gpu=use_gpu
+            factor_subset_size=args.factor_subset_size, skip_training=args.skip_training, use_gpu=use_gpu, store_influence=store_influence
         )
         print(f"\nSingle experiment completed:")
         print(f"Parameters: {result.model_params:,}")

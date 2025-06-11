@@ -11,10 +11,13 @@ PYTHON_SCRIPT="$SCRIPT_DIR/00_toy_scaling_test.py"
 
 # 2000 6325 20000 63245 200000 632455 2000000
 # "tiny" "small" "medium" "large" "huge" "mega" "giga"
+# "giga-C" "giga-D" "giga-E"
+# "large-plus" "huge-plus" "mega-plus"
+# "mega-A" "mega-plus" "mega-B"
 
 # Test parameters
-MODEL_SIZES=("giga-B")
-DATASET_SIZES=(2000 6325 20000 63245 200000 632455 2000000)
+MODEL_SIZES=("mega-A" "mega-plus" "mega-B")
+DATASET_SIZES=(2000000)
 QUERY_SIZE=3
 STRATEGY="ekfac"
 NUM_RUNS=1  # Average over 3 runs for more stable timing
@@ -58,6 +61,14 @@ run_experiment() {
     
     if [ "$SKIP_TRAINING" = true ]; then
         cmd="$cmd --skip-training"
+    fi
+    
+    if [ -n "$RESULTS_DIR_ARG" ]; then
+        cmd="$cmd --results-dir $RESULTS_DIR_ARG"
+    fi
+    
+    if [ "$STORE_INFLUENCE_OFF" = true ]; then
+        cmd="$cmd --store-influence-off"
     fi
     
     # Run the experiment
@@ -161,6 +172,8 @@ show_help() {
     echo "  --cpu              Force CPU usage instead of GPU"
     echo "  --quick            Use single run instead of 3 runs (faster but less accurate)"
     echo "  --skip-training    Skip model training and use random weights (pure timing benchmark)"
+    echo "  --results-dir DIR  Directory to save results (default: kronfluence/experiments/data)"
+    echo "  --store-influence-off  Don't store influence scores in JSON files to reduce file size"
     echo
     echo "Model sizes: ${MODEL_SIZES[*]}"
     echo "Dataset sizes: ${DATASET_SIZES[*]}"
@@ -194,6 +207,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_TRAINING=true
             shift
             ;;
+        --results-dir)
+            RESULTS_DIR_ARG="$2"
+            shift 2
+            ;;
+        --store-influence-off)
+            STORE_INFLUENCE_OFF=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             show_help
@@ -217,6 +238,12 @@ if [ "$DRY_RUN" = true ]; then
             fi
             if [ "$SKIP_TRAINING" = true ]; then
                 cmd="$cmd --skip-training"
+            fi
+            if [ -n "$RESULTS_DIR_ARG" ]; then
+                cmd="$cmd --results-dir $RESULTS_DIR_ARG"
+            fi
+            if [ "$STORE_INFLUENCE_OFF" = true ]; then
+                cmd="$cmd --store-influence-off"
             fi
             echo "$cmd"
         done
