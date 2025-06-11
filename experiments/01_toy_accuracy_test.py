@@ -1,569 +1,566 @@
+#!/usr/bin/env python3
 """
-Fisher/Hessian Approximation Accuracy Test
+Toy Accuracy Test for Kronfluence
 
-This test measures the accuracy of our Fisher/Hessian approximation methods
-(KFAC, EKFAC, Diagonal) by comparing them against ground truth computations.
-The accuracy is measured using L2 norm of the difference between approximation
-and ground truth.
+This script tests the accuracy of influence scores by comparing influence computations 
+with different sample sizes for factor computation. It creates a toy regression model 
+with ~1000 parameters, trains it on 1000 training points for 20 epochs, then evaluates 
+how the number of samples used for factor computation affects influence score accuracy.
 
-Model sizes: 10^3 to 10^4 parameters
-Training data: 10^3 to 10^4 samples
+The test compares influence scores computed with:
+- M=25 samples (default)
+- M=K samples (commandline argument)  
+- M=N samples (all training points)
+
+Accuracy is measured using MSE between M=K and M=N influence scores.
 """
 
-import math
-import time
+import argparse
+import logging
 import os
+import time
+import json
 import tempfile
-import shutil
-from typing import Dict, List, Tuple, Optional
+from typing import Tuple, Dict, Any
+from dataclasses import dataclass, asdict
+from datetime import datetime
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from scipy.stats import spearmanr
 
-from kronfluence.arguments import FactorArguments
-from kronfluence.analyzer import Analyzer
-from kronfluence.factor.config import FactorStrategy
-from kronfluence.state import State
+from kronfluence.analyzer import Analyzer, prepare_model
+from kronfluence.arguments import FactorArguments, ScoreArguments
 from kronfluence.task import Task
-from kronfluence.utils.model import apply_ddp, get_tracked_module_names
-from kronfluence.utils.constants import (
-    ACTIVATION_EIGENVECTORS_NAME,
-    ACTIVATION_EIGENVALUES_NAME,
-    GRADIENT_EIGENVECTORS_NAME,
-    GRADIENT_EIGENVALUES_NAME,
-    LAMBDA_MATRIX_NAME,
-)
+
+BATCH_TYPE = Tuple[torch.Tensor, torch.Tensor]
+RESULTS_DIR = "/share/u/yu.stev/influence/kronfluence/data/accuracy"
 
 
-class ToyRegressionTask(Task):
-    """Simple regression task for testing."""
+@dataclass
+class AccuracyTestResults:
+    """Store accuracy test results for influence score comparisons."""
+    model_params: int
+    model_size_target: int  # Target model size requested
+    dataset_size: int
+    query_size: int
+    epochs: int
+    m_test: int     # Test M (K from commandline)
+    m_full: int     # Full M (N, all training points, or "random" if using random baseline)
+    mse_test_vs_full: float     # MSE between M=K and M=N (or random)
+    spearman_correlation: float  # Spearman rank correlation coefficient
+    spearman_pvalue: float      # P-value for Spearman correlation
+    baseline_type: str          # "full_dataset" or "random"
+    factor_time_test: float
+    factor_time_full: float
+    score_time: float
+    timestamp: str
+    experiment_id: str
+
+
+class ToyDataset(Dataset):
+    """Simple dataset with random features and targets for regression."""
+    
+    def __init__(self, num_samples: int, input_dim: int, noise_std: float = 0.1, seed: int = 42):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        
+        # Generate random features
+        self.features = torch.randn(num_samples, input_dim)
+        
+        # Generate targets with some structure (linear combination + noise)
+        true_weights = torch.randn(input_dim, 1) * 0.5
+        self.targets = (self.features @ true_weights).squeeze() + torch.randn(num_samples) * noise_std
+        
+    def __len__(self) -> int:
+        return len(self.features)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.features[idx], self.targets[idx].unsqueeze(0)
+
+
+class ToyModel(nn.Module):
+    """Simple MLP with configurable size to hit target parameter counts."""
+    
+    def __init__(self, input_dim: int = 10, target_params: int = 1000, output_dim: int = 1):
+        super().__init__()
+        
+        # Predefined configurations for common parameter targets
+        # Format: (hidden1_size, hidden2_size)
+        param_configs = {
+            1000: (30, 25),     # ~1131 params (original)
+            2500: (200, 3),     # ~2609 params
+            5000: (350, 3),     # ~4907 params  
+            7500: (500, 3),     # ~5507 params
+            10000: (650, 3),    # ~9107 params
+            12500: (800, 3),    # ~12407 params
+            15000: (1000, 4),   # ~15009 params
+            17500: (1150, 4),   # ~17359 params
+            20000: (1300, 4),   # ~19509 params
+        }
+        
+        # Find the closest configuration
+        closest_target = min(param_configs.keys(), key=lambda x: abs(x - target_params))
+        h1, h2 = param_configs[closest_target]
+        
+        # Build the network
+        # Layer 1: (input_dim + 1) * h1 params
+        # Layer 2: (h1 + 1) * h2 params  
+        # Layer 3: (h2 + 1) * output_dim params
+        
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, h1, bias=True),
+            nn.ReLU(),
+            nn.Linear(h1, h2, bias=True),
+            nn.ReLU(), 
+            nn.Linear(h2, output_dim, bias=True)
+        )
+        
+        # Store the target for reference
+        self.target_params = target_params
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+    
+    def count_parameters(self) -> int:
+        """Count total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class ToyTask(Task):
+    """Task definition for toy regression problems."""
     
     def compute_train_loss(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: BATCH_TYPE,
         model: nn.Module,
         sample: bool = False,
     ) -> torch.Tensor:
         inputs, targets = batch
         outputs = model(inputs)
+        
         if not sample:
             return F.mse_loss(outputs, targets, reduction="sum")
-        # Sample outputs for true Fisher computation
+        
+        # For sampling mode, add noise to targets for Fisher approximation
         with torch.no_grad():
-            sampled_targets = torch.normal(outputs.detach(), std=math.sqrt(0.1))
+            sampled_targets = torch.normal(outputs.detach(), std=0.1)
         return F.mse_loss(outputs, sampled_targets, reduction="sum")
-
+    
     def compute_measurement(
         self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
+        batch: BATCH_TYPE,
         model: nn.Module,
     ) -> torch.Tensor:
+        # Use same as training loss for simplicity
         return self.compute_train_loss(batch, model, sample=False)
 
-    def tracked_modules(self) -> Optional[List[str]]:
-        return None  # Track all modules
 
-
-class ToyClassificationTask(Task):
-    """Simple classification task for testing."""
+def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 20, lr: float = 0.01, device: str = "cpu") -> None:
+    """Train the toy model for the specified number of epochs."""
     
-    def compute_train_loss(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
-        model: nn.Module,
-        sample: bool = False,
-    ) -> torch.Tensor:
-        inputs, targets = batch
-        logits = model(inputs)
-        if not sample:
-            return F.cross_entropy(logits, targets, reduction="sum")
-        # Sample from model predictions for true Fisher
-        with torch.no_grad():
-            probs = F.softmax(logits.detach(), dim=-1)
-            sampled_targets = torch.multinomial(probs, num_samples=1).squeeze()
-        return F.cross_entropy(logits, sampled_targets, reduction="sum")
-
-    def compute_measurement(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor],
-        model: nn.Module,
-    ) -> torch.Tensor:
-        return self.compute_train_loss(batch, model, sample=False)
-
-    def tracked_modules(self) -> Optional[List[str]]:
-        return None
-
-
-def create_toy_regression_model(input_dim: int, hidden_dims: List[int], output_dim: int) -> nn.Module:
-    """Create a small MLP for regression."""
-    layers = []
-    prev_dim = input_dim
+    # Make training deterministic
+    torch.manual_seed(42)
     
-    for i, hidden_dim in enumerate(hidden_dims):
-        layers.append(nn.Linear(prev_dim, hidden_dim))
-        if i < len(hidden_dims) - 1:  # No activation after last hidden layer
-            layers.append(nn.ReLU())
-        prev_dim = hidden_dim
+    # Move model to device
+    model = model.to(device)
     
-    layers.append(nn.Linear(prev_dim, output_dim))
-    return nn.Sequential(*layers)
-
-
-def create_toy_classification_model(input_dim: int, hidden_dims: List[int], num_classes: int) -> nn.Module:
-    """Create a small MLP for classification."""
-    layers = []
-    prev_dim = input_dim
+    # Use shuffle=False for deterministic training order
+    dataloader = DataLoader(dataset, batch_size=min(64, len(dataset)), shuffle=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(prev_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        prev_dim = hidden_dim
+    model.train()
+    print(f"Training model for {epochs} epochs...")
     
-    layers.append(nn.Linear(prev_dim, num_classes))
-    return nn.Sequential(*layers)
-
-
-def generate_regression_data(n_samples: int, input_dim: int, output_dim: int, 
-                           noise_std: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate synthetic regression data."""
-    X = torch.randn(n_samples, input_dim)
-    # Create some ground truth relationship
-    true_weights = torch.randn(input_dim, output_dim)
-    y = X @ true_weights + noise_std * torch.randn(n_samples, output_dim)
-    return X, y
-
-
-def generate_classification_data(n_samples: int, input_dim: int, num_classes: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate synthetic classification data."""
-    X = torch.randn(n_samples, input_dim)
-    # Create some ground truth classification boundary
-    weights = torch.randn(input_dim, num_classes)
-    logits = X @ weights
-    y = torch.argmax(logits, dim=1)
-    return X, y
-
-
-def compute_exact_fisher_matrix(model: nn.Module, dataloader: DataLoader, task: Task) -> torch.Tensor:
-    """
-    Compute the exact Fisher Information Matrix for comparison.
-    This is computationally expensive and only feasible for small models.
-    """
-    # Get all parameters
-    params = []
-    for param in model.parameters():
-        if param.requires_grad:
-            params.append(param.view(-1))
-    total_params = sum(p.numel() for p in params)
-    
-    # Initialize Fisher matrix
-    fisher_matrix = torch.zeros(total_params, total_params, device=next(model.parameters()).device)
-    
-    model.eval()
-    total_samples = 0
-    
-    for batch in dataloader:
-        inputs, targets = batch
-        batch_size = inputs.size(0)
-        
-        for i in range(batch_size):
-            # Single sample
-            single_input = inputs[i:i+1]
-            single_target = targets[i:i+1]
-            
-            # Forward pass
-            model.zero_grad()
-            loss = task.compute_train_loss((single_input, single_target), model, sample=True)
-            
-            # Backward pass to get gradients
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch in dataloader:
+            optimizer.zero_grad()
+            inputs, targets = batch
+            # Move data to device
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            outputs = model(inputs)
+            loss = F.mse_loss(outputs, targets)
             loss.backward()
-            
-            # Extract gradients
-            grads = []
-            for param in model.parameters():
-                if param.requires_grad and param.grad is not None:
-                    grads.append(param.grad.view(-1))
-            
-            if grads:
-                grad_vector = torch.cat(grads)
-                # Add outer product to Fisher matrix
-                fisher_matrix += torch.outer(grad_vector, grad_vector)
+            optimizer.step()
+            total_loss += loss.item()
         
-        total_samples += batch_size
-    
-    # Average over samples
-    fisher_matrix /= total_samples
-    return fisher_matrix
+        if epoch % 5 == 0 or epoch == epochs - 1:
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch:2d}/{epochs}: Loss = {avg_loss:.6f}")
 
 
-def reconstruct_kfac_fisher_matrix(eigendecomposition_factors, lambda_factors, module_names, device):
+def compute_influence_scores_with_sample_size(
+    model: nn.Module,
+    task: Task,
+    train_dataset: Dataset,
+    query_dataset: Dataset,
+    sample_size: int,
+    analysis_name: str,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, float, float]:
     """
-    Reconstruct the full Fisher matrix from KFAC factors.
-    For KFAC: F^{-1} ≈ (A ⊗ G)^{-1} where A and G are covariance matrices
-    """
-    block_matrices = []
-    
-    for module_name in module_names:
-        # Get eigenvectors and eigenvalues
-        A_eigvecs = eigendecomposition_factors[ACTIVATION_EIGENVECTORS_NAME][module_name].to(device)
-        G_eigvecs = eigendecomposition_factors[GRADIENT_EIGENVECTORS_NAME][module_name].to(device)
-        A_eigvals = eigendecomposition_factors[ACTIVATION_EIGENVALUES_NAME][module_name].to(device)
-        G_eigvals = eigendecomposition_factors[GRADIENT_EIGENVALUES_NAME][module_name].to(device)
-        
-        # Reconstruct covariance matrices
-        A_cov = A_eigvecs @ torch.diag(A_eigvals) @ A_eigvecs.t()
-        G_cov = G_eigvecs @ torch.diag(G_eigvals) @ G_eigvecs.t()
-        
-        # Compute Kronecker product approximation
-        # F ≈ G ⊗ A (note the order)
-        fisher_block = torch.kron(G_cov, A_cov)
-        block_matrices.append(fisher_block)
-    
-    # Concatenate all blocks to form full matrix
-    if len(block_matrices) == 1:
-        return block_matrices[0]
-    else:
-        # Block diagonal matrix
-        total_size = sum(mat.size(0) for mat in block_matrices)
-        full_matrix = torch.zeros(total_size, total_size, device=device)
-        start_idx = 0
-        for mat in block_matrices:
-            end_idx = start_idx + mat.size(0)
-            full_matrix[start_idx:end_idx, start_idx:end_idx] = mat
-            start_idx = end_idx
-        return full_matrix
-
-
-def reconstruct_ekfac_fisher_matrix(eigendecomposition_factors, lambda_factors, module_names, device):
-    """
-    Reconstruct the full Fisher matrix from EKFAC factors.
-    EKFAC uses corrected eigenvalues (Lambda matrices)
-    """
-    block_matrices = []
-    
-    for module_name in module_names:
-        # Get eigenvectors and lambda matrix
-        A_eigvecs = eigendecomposition_factors[ACTIVATION_EIGENVECTORS_NAME][module_name].to(device)
-        G_eigvecs = eigendecomposition_factors[GRADIENT_EIGENVECTORS_NAME][module_name].to(device)
-        lambda_matrix = lambda_factors[LAMBDA_MATRIX_NAME][module_name].to(device)
-        
-        # EKFAC reconstruction: F ≈ (G ⊗ A) where eigenvalues are corrected
-        # The lambda matrix contains the corrected eigenvalues
-        # We need to reconstruct the approximation
-        
-        # Create the Fisher approximation using corrected eigenvalues
-        # This is a simplified reconstruction - full EKFAC is more complex
-        fisher_block = torch.kron(G_eigvecs @ torch.diag(lambda_matrix.mean(dim=0)) @ G_eigvecs.t(),
-                                 A_eigvecs @ torch.diag(lambda_matrix.mean(dim=1)) @ A_eigvecs.t())
-        block_matrices.append(fisher_block)
-    
-    # Concatenate all blocks
-    if len(block_matrices) == 1:
-        return block_matrices[0]
-    else:
-        total_size = sum(mat.size(0) for mat in block_matrices)
-        full_matrix = torch.zeros(total_size, total_size, device=device)
-        start_idx = 0
-        for mat in block_matrices:
-            end_idx = start_idx + mat.size(0)
-            full_matrix[start_idx:end_idx, start_idx:end_idx] = mat
-            start_idx = end_idx
-        return full_matrix
-
-
-def reconstruct_diagonal_fisher_matrix(lambda_factors, module_names, device):
-    """
-    Reconstruct the diagonal Fisher matrix approximation.
-    """
-    diagonal_elements = []
-    
-    for module_name in module_names:
-        lambda_matrix = lambda_factors[LAMBDA_MATRIX_NAME][module_name].to(device)
-        # For diagonal approximation, lambda matrix is diagonal
-        diagonal_elements.append(lambda_matrix.view(-1))
-    
-    # Concatenate all diagonal elements
-    full_diagonal = torch.cat(diagonal_elements)
-    return torch.diag(full_diagonal)
-
-
-def compute_approximation_fisher_matrix(model: nn.Module, dataloader: DataLoader, 
-                                      task: Task, strategy: str, state: State) -> torch.Tensor:
-    """
-    Compute Fisher matrix approximation using the specified strategy.
-    """
-    # Create temporary directory for factors
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        factor_args = FactorArguments(
-            strategy=strategy,
-            use_empirical_fisher=False,  # Use true Fisher
-            covariance_max_examples=None,  # Use all data
-            lambda_max_examples=None,
-        )
-        
-        # Initialize analyzer
-        analyzer = Analyzer(
-            analysis_name="fisher_test",
-            model=model,
-            task=task,
-            state=state,
-            cache_dir=temp_dir,
-            logging_level="ERROR"  # Reduce logging output
-        )
-        
-        # Fit all factors
-        analyzer.fit_all_factors(
-            factors_name="test_factors",
-            dataset=dataloader.dataset,
-            factor_args=factor_args,
-            per_device_batch_size=32,
-            overwrite_output_dir=True,
-        )
-        
-        # Load the computed factors
-        device = next(model.parameters()).device
-        module_names = get_tracked_module_names(model)
-        
-        if strategy == "diagonal":
-            lambda_factors = analyzer.load_lambda_matrices(factors_name="test_factors")
-            return reconstruct_diagonal_fisher_matrix(lambda_factors, module_names, device)
-        
-        elif strategy in ["kfac", "ekfac"]:
-            eigendecomposition_factors = analyzer.load_eigendecomposition(factors_name="test_factors")
-            
-            if strategy == "kfac":
-                return reconstruct_kfac_fisher_matrix(
-                    eigendecomposition_factors, None, module_names, device
-                )
-            else:  # ekfac
-                lambda_factors = analyzer.load_lambda_matrices(factors_name="test_factors")
-                return reconstruct_ekfac_fisher_matrix(
-                    eigendecomposition_factors, lambda_factors, module_names, device
-                )
-        
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-            
-    finally:
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def run_accuracy_test(model_config: Dict, data_config: Dict, task_type: str = "regression") -> Dict:
-    """
-    Run accuracy test for a given model and data configuration.
-    
-    Args:
-        model_config: Dict with model parameters
-        data_config: Dict with data generation parameters  
-        task_type: "regression" or "classification"
+    Compute influence scores using a specific sample size for factor computation.
     
     Returns:
-        Dict with test results including L2 norms
+        Tuple of (influence_scores, factor_time, score_time)
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create model
-    if task_type == "regression":
-        model = create_toy_regression_model(
-            input_dim=model_config["input_dim"],
-            hidden_dims=model_config["hidden_dims"],
-            output_dim=model_config["output_dim"]
-        ).to(device)
-        task = ToyRegressionTask()
-        
-        # Generate data
-        X, y = generate_regression_data(
-            n_samples=data_config["n_samples"],
-            input_dim=model_config["input_dim"],
-            output_dim=model_config["output_dim"],
-            noise_std=data_config.get("noise_std", 0.1)
-        )
+    print(f"Computing influence scores with sample_size={sample_size}")
+    
+    # Set seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        # Ensure deterministic CUDA operations
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    # Create output directory for this analysis
+    analysis_output_dir = os.path.join(RESULTS_DIR, analysis_name)
+    os.makedirs(analysis_output_dir, exist_ok=True)
+    
+    # Create analyzer
+    analyzer = Analyzer(
+        analysis_name=analysis_name,
+        model=model,
+        task=task,
+        cpu=(device == "cpu"),
+        disable_tqdm=False,
+        output_dir=analysis_output_dir
+    )
+    
+    # Set up factor arguments with limited sample size
+    factor_args = FactorArguments(
+        strategy="ekfac",
+        covariance_max_examples=sample_size,
+        lambda_max_examples=sample_size
+    )
+    
+    # Compute factors (time this step)
+    factor_start_time = time.time()
+    analyzer.fit_all_factors(
+        factors_name="test_factors",
+        dataset=train_dataset,
+        per_device_batch_size=min(32, len(train_dataset)),
+        factor_args=factor_args,
+        overwrite_output_dir=True,
+    )
+    factor_time = time.time() - factor_start_time
+    
+    # Compute pairwise scores (time this step)
+    score_start_time = time.time()
+    analyzer.compute_pairwise_scores(
+        scores_name="test_scores",
+        factors_name="test_factors",
+        query_dataset=query_dataset,
+        train_dataset=train_dataset,
+        per_device_query_batch_size=min(32, len(query_dataset)),
+        per_device_train_batch_size=min(32, len(train_dataset)),
+        overwrite_output_dir=True,
+    )
+    score_time = time.time() - score_start_time
+    
+    # Load the computed scores
+    scores = analyzer.load_pairwise_scores("test_scores")["all_modules"]
+    
+    return scores, factor_time, score_time
+
+
+def run_accuracy_test(
+    dataset_size: int = 1000,
+    query_size: int = 50,
+    m_test: int = 100,
+    epochs: int = 20,
+    model_size: int = 1000,
+    device: str = "cpu",
+    save_results: bool = True,
+    use_random_baseline: bool = False,
+    output_dir: str = RESULTS_DIR
+) -> AccuracyTestResults:
+    """
+    Run the complete accuracy test comparing influence scores with different sample sizes.
+    """
+    
+    print("="*80)
+    print("KRONFLUENCE TOY ACCURACY TEST")
+    print("="*80)
+    print(f"Dataset size: {dataset_size}")
+    print(f"Query size: {query_size}")
+    print(f"Model size target: ~{model_size} parameters")
+    
+    if use_random_baseline:
+        print(f"Baseline: M={m_test} vs Random Matrix")
+        print(f"This tests correlation against random scores (should be ~0)")
     else:
-        model = create_toy_classification_model(
-            input_dim=model_config["input_dim"],
-            hidden_dims=model_config["hidden_dims"],
-            num_classes=model_config["num_classes"]
-        ).to(device)
-        task = ToyClassificationTask()
-        
-        # Generate data
-        X, y = generate_classification_data(
-            n_samples=data_config["n_samples"],
-            input_dim=model_config["input_dim"],
-            num_classes=model_config["num_classes"]
+        print(f"Sample sizes to test: M={m_test}, M={dataset_size} (full)")
+    
+    print(f"Training epochs: {epochs}")
+    print(f"Device: {device}")
+    print()
+    
+    # Create datasets
+    train_dataset = ToyDataset(num_samples=dataset_size, input_dim=10, seed=42)
+    query_dataset = ToyDataset(num_samples=query_size, input_dim=10, seed=123)  # Different seed for queries
+    
+    # Create and train model with specified target parameter count
+    model = ToyModel(input_dim=10, target_params=model_size)
+    param_count = model.count_parameters()
+    print(f"Model has {param_count:,} parameters (target: {model_size:,})")
+    
+    train_toy_model(model, train_dataset, epochs=epochs, device=device)
+    print()
+    
+    # Prepare model for analysis
+    task = ToyTask()
+    model = prepare_model(model, task)
+    
+    # Compute influence scores with different sample sizes
+    print("Computing influence scores...")
+    print()
+    
+    # M = K (test value)
+    scores_test, factor_time_test, _ = compute_influence_scores_with_sample_size(
+        model, task, train_dataset, query_dataset, m_test, "analysis_test", device
+    )
+    
+    if use_random_baseline:
+        # Generate random scores with same shape as test scores
+        print("Generating random baseline scores...")
+        np.random.seed(999)  # Different seed for random baseline
+        scores_baseline = torch.from_numpy(np.random.randn(*scores_test.shape)).to(scores_test.device).to(scores_test.dtype)
+        factor_time_full = 0.0  # No computation time for random
+        score_time = 0.0
+        baseline_type = "random"
+        m_full_display = "random"
+    else:
+        # M = N (full dataset)
+        scores_baseline, factor_time_full, score_time = compute_influence_scores_with_sample_size(
+            model, task, train_dataset, query_dataset, dataset_size, "analysis_full", device
         )
+        baseline_type = "full_dataset"
+        m_full_display = dataset_size
     
-    # Create dataloader
-    dataset = TensorDataset(X.to(device), y.to(device))
-    dataloader = DataLoader(dataset, batch_size=data_config.get("batch_size", 32), shuffle=False)
+    # Calculate MSE and correlation
+    mse_test_vs_full = F.mse_loss(scores_test, scores_baseline).item()
     
-    # Prepare model for kronfluence
-    model = apply_ddp(model, State())
+    # Calculate Spearman correlation (rank-based)
+    scores_test_flat = scores_test.flatten().cpu().numpy()
+    scores_baseline_flat = scores_baseline.flatten().cpu().numpy()
+    spearman_corr, spearman_p = spearmanr(scores_test_flat, scores_baseline_flat)
     
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Sanity checks
+    if not use_random_baseline and m_test == dataset_size:
+        print(f"SANITY CHECK (M_test = M_full = {dataset_size}):")
+        print(f"  MSE = {mse_test_vs_full:.10f} (should be ≈ 0)")
+        print(f"  Spearman correlation = {spearman_corr:.10f} (should be ≈ 1)")
+        if mse_test_vs_full > 1e-6 or spearman_corr < 0.999999:
+            print(f"  WARNING: Non-deterministic behavior detected!")
+        print()
+    elif use_random_baseline:
+        print(f"RANDOM BASELINE CHECK:")
+        print(f"  Spearman correlation = {spearman_corr:.6f} (should be ≈ 0)")
+        print(f"  This gives you a sense of what 'no correlation' looks like")
+        print()
     
-    print(f"Model has {total_params} parameters")
-    print(f"Data has {data_config['n_samples']} samples")
+    # Create results
+    results = AccuracyTestResults(
+        model_params=param_count,
+        model_size_target=model_size,
+        dataset_size=dataset_size,
+        query_size=query_size,
+        epochs=epochs,
+        m_test=m_test,
+        m_full=dataset_size if not use_random_baseline else -1,  # -1 indicates random
+        mse_test_vs_full=mse_test_vs_full,
+        spearman_correlation=spearman_corr,
+        spearman_pvalue=spearman_p,
+        baseline_type=baseline_type,
+        factor_time_test=factor_time_test,
+        factor_time_full=factor_time_full,
+        score_time=score_time,
+        timestamp=datetime.now().isoformat(),
+        experiment_id=f"accuracy_test_m{m_test}_vs_{m_full_display}_{int(time.time())}"
+    )
     
-    # Skip if model is too large for exact computation
-    if total_params > 10000:
-        print("Model too large for exact Fisher computation, skipping...")
-        return {"error": "Model too large for exact computation"}
+    # Print results
+    print("="*80)
+    print("ACCURACY TEST RESULTS")
+    print("="*80)
+    print(f"Model parameters: {results.model_params:,}")
+    print(f"Model size target: ~{results.model_size_target:,} parameters")
+    print(f"Dataset size: {results.dataset_size:,}")
+    print(f"Query size: {results.query_size:,}")
+    print(f"Training epochs: {results.epochs}")
+    print()
+    print("Comparison:")
+    print(f"  Test M = {results.m_test}")
+    print(f"  Baseline = {m_full_display}")
+    print(f"  Baseline type = {results.baseline_type}")
+    print()
+    print("Accuracy Metrics:")
+    print(f"  MSE: {results.mse_test_vs_full:.8f}")
+    print(f"  Spearman Correlation: {results.spearman_correlation:.6f} (p={results.spearman_pvalue:.2e})")
+    print()
+    print("Interpretation:")
+    if use_random_baseline:
+        if abs(results.spearman_correlation) < 0.1:
+            print("  ✅ Good - correlation with random is near zero as expected")
+        else:
+            print("  ⚠️  Warning - unexpectedly high correlation with random scores")
+    else:
+        if results.spearman_correlation > 0.9:
+            print("  🥇 Excellent rank correlation - influence rankings well preserved")
+        elif results.spearman_correlation > 0.7:
+            print("  🥈 Good rank correlation - influence rankings reasonably preserved")
+        elif results.spearman_correlation > 0.5:
+            print("  🥉 Moderate rank correlation - some ranking preservation")
+        else:
+            print("  ❌ Poor rank correlation - ranking preservation is weak")
+    print()
+    print("Timing:")
+    print(f"  Factor computation time (M={results.m_test}): {results.factor_time_test:.2f}s") 
+    if not use_random_baseline:
+        print(f"  Factor computation time (M={m_full_display}): {results.factor_time_full:.2f}s")
+        print(f"  Score computation time: {results.score_time:.2f}s")
+    print()
+    print("="*80)
     
-    # Compute ground truth Fisher matrix
-    print("Computing exact Fisher matrix...")
-    start_time = time.time()
-    try:
-        exact_fisher = compute_exact_fisher_matrix(model, dataloader, task)
-        exact_time = time.time() - start_time
-        print(f"Exact Fisher computation took {exact_time:.2f} seconds")
-    except Exception as e:
-        print(f"Failed to compute exact Fisher: {e}")
-        return {"error": str(e)}
-    
-    results = {
-        "model_params": total_params,
-        "data_samples": data_config["n_samples"],
-        "exact_fisher_time": exact_time,
-        "approximations": {}
-    }
-    
-    # Test each approximation strategy
-    strategies = ["diagonal", "kfac", "ekfac"]
-    state = State()
-    
-    for strategy in strategies:
-        print(f"\nTesting {strategy.upper()} approximation...")
-        start_time = time.time()
-        
-        try:
-            approx_fisher = compute_approximation_fisher_matrix(
-                model, dataloader, task, strategy, state
-            )
-            approx_time = time.time() - start_time
-            
-            # Compute L2 norm of difference
-            diff = exact_fisher - approx_fisher
-            l2_norm = torch.norm(diff, p=2).item()
-            relative_error = l2_norm / torch.norm(exact_fisher, p=2).item()
-            
-            results["approximations"][strategy] = {
-                "l2_norm_diff": l2_norm,
-                "relative_error": relative_error,
-                "computation_time": approx_time,
-                "speedup": exact_time / approx_time if approx_time > 0 else float('inf')
-            }
-            
-            print(f"{strategy.upper()} - L2 norm difference: {l2_norm:.6f}")
-            print(f"{strategy.upper()} - Relative error: {relative_error:.6f}")
-            print(f"{strategy.upper()} - Computation time: {approx_time:.2f}s")
-            print(f"{strategy.upper()} - Speedup: {results['approximations'][strategy]['speedup']:.2f}x")
-            
-        except Exception as e:
-            print(f"Failed to compute {strategy} approximation: {e}")
-            results["approximations"][strategy] = {"error": str(e)}
+    # Save results if requested
+    if save_results:
+        save_results_to_file(results, output_dir)
     
     return results
 
 
+def save_results_to_file(results: AccuracyTestResults, output_dir: str) -> str:
+    """Save results to a JSON file."""
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    filename = f"accuracy_test_m{results.m_test}_vs_{results.m_full}_{int(time.time())}.json"
+    filepath = os.path.join(output_dir, filename)
+    
+    with open(filepath, 'w') as f:
+        json.dump(asdict(results), f, indent=2)
+    
+    print(f"Results saved to: {filepath}")
+    return filepath
+
+
 def main():
-    """Run the accuracy tests with different model and data sizes."""
+    parser = argparse.ArgumentParser(
+        description="Toy accuracy test for Kronfluence influence score computation"
+    )
     
-    # Test configurations - starting with very small models
-    test_configs = [
-        {
-            "name": "Tiny Model, Small Data",
-            "model": {
-                "input_dim": 5,
-                "hidden_dims": [10],
-                "output_dim": 1,
-                "num_classes": 2  # for classification
-            },
-            "data": {
-                "n_samples": 50,
-                "batch_size": 16
-            }
-        },
-        {
-            "name": "Small Model, Small Data",
-            "model": {
-                "input_dim": 10,
-                "hidden_dims": [20, 10],
-                "output_dim": 1,
-                "num_classes": 3  # for classification
-            },
-            "data": {
-                "n_samples": 100,
-                "batch_size": 16
-            }
-        },
-        {
-            "name": "Medium Model, Medium Data",
-            "model": {
-                "input_dim": 20,
-                "hidden_dims": [40, 20],
-                "output_dim": 1,
-                "num_classes": 5
-            },
-            "data": {
-                "n_samples": 500,
-                "batch_size": 32
-            }
-        }
-    ]
+    parser.add_argument(
+        "--dataset_size",
+        type=int,
+        default=1000,
+        help="Number of training points (default: 1000)"
+    )
     
-    all_results = {}
+    parser.add_argument(
+        "--query_size", 
+        type=int,
+        default=50,
+        help="Number of query points (default: 50)"
+    )
     
-    for config in test_configs:
-        print(f"\n{'='*60}")
-        print(f"Running test: {config['name']}")
-        print(f"{'='*60}")
-        
-        # Test regression
-        print(f"\n--- REGRESSION TEST ---")
-        reg_results = run_accuracy_test(
-            model_config=config["model"],
-            data_config=config["data"],
-            task_type="regression"
-        )
-        
-        # Test classification  
-        print(f"\n--- CLASSIFICATION TEST ---")
-        clf_results = run_accuracy_test(
-            model_config=config["model"],
-            data_config=config["data"],
-            task_type="classification"
-        )
-        
-        all_results[config["name"]] = {
-            "regression": reg_results,
-            "classification": clf_results
-        }
+    parser.add_argument(
+        "--m_test",
+        type=int,
+        default=100,
+        help="Test sample size K for factor computation (default: 100)"
+    )
     
-    # Print summary
-    print(f"\n{'='*60}")
-    print("SUMMARY OF RESULTS")
-    print(f"{'='*60}")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Number of training epochs (default: 20)"
+    )
     
-    for test_name, results in all_results.items():
-        print(f"\n{test_name}:")
-        for task_type, task_results in results.items():
-            if "error" not in task_results:
-                print(f"  {task_type.title()}:")
-                print(f"    Model params: {task_results['model_params']}")
-                print(f"    Data samples: {task_results['data_samples']}")
-                for strategy, metrics in task_results.get("approximations", {}).items():
-                    if "error" not in metrics:
-                        print(f"    {strategy.upper()}: L2={metrics['l2_norm_diff']:.6f}, "
-                              f"RelErr={metrics['relative_error']:.6f}, "
-                              f"Speedup={metrics['speedup']:.2f}x")
-            else:
-                print(f"  {task_type.title()}: {task_results['error']}")
+    parser.add_argument(
+        "--model_size",
+        type=int,
+        default=1000,
+        choices=[1000, 2500, 5000, 7500, 10000, 12500, 15000, 17500, 20000],
+        help="Target number of model parameters (default: 1000)"
+    )
+    
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to use for computation (default: cpu)"
+    )
+    
+    parser.add_argument(
+        "--random_baseline",
+        action="store_true",
+        help="Test correlation against random matrix instead of full dataset"
+    )
+    
+    parser.add_argument(
+        "--no_save",
+        action="store_true",
+        help="Don't save results to file"
+    )
+    
+    parser.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)"
+    )
+    
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=RESULTS_DIR,
+        help=f"Directory to save results (default: {RESULTS_DIR})"
+    )
+    
+    args = parser.parse_args()
+    
+    # Set up logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Validate arguments
+    if not args.random_baseline and args.m_test > args.dataset_size:
+        raise ValueError(f"m_test ({args.m_test}) cannot be larger than dataset_size ({args.dataset_size})")
+    
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available, falling back to CPU")
+        args.device = "cpu"
+    
+    # Run the accuracy test
+    results = run_accuracy_test(
+        dataset_size=args.dataset_size,
+        query_size=args.query_size,
+        m_test=args.m_test,
+        epochs=args.epochs,
+        model_size=args.model_size,
+        device=args.device,
+        save_results=not args.no_save,
+        use_random_baseline=args.random_baseline,
+        output_dir=args.output_dir
+    )
+    
+    return results
 
 
 if __name__ == "__main__":
