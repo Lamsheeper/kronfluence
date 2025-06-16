@@ -10,17 +10,18 @@
 # Default configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/01_toy_accuracy_test.py"
-RESULTS_DIR="/share/u/yu.stev/influence/kronfluence/data/accuracy/experiment3"
+RESULTS_DIR="/share/u/yu.stev/influence/kronfluence/data/accuracy/experiment6"
 LOG_FILE="$RESULTS_DIR/accuracy_test_run.log"
 
 # Default test parameters
-DATASET_SIZES=(20000)
-SAMPLE_SIZES=(500)
-MODEL_SIZES=(2500 7500 12500 17500)
-EPOCHS=20
+DATASET_SIZES=(200000)
+SAMPLE_SIZES=(1)
+MODEL_SIZES=(20000)
+EPOCHS=10
 QUERY_SIZE=50
 DEVICE="cuda"
 RUN_RANDOM_BASELINE=true  # Default: run random baseline tests
+NUM_TRIALS=2  # Default: run 5 trials per test for averaged results
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,6 +50,7 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  --no-random-baseline    Skip random baseline tests"
+    echo "  --num-trials N          Number of trials to run per test (default: $NUM_TRIALS)"
     echo "  --help                  Show this help message"
     echo ""
     echo "This script runs accuracy tests with the following default configuration:"
@@ -58,6 +60,7 @@ show_usage() {
     echo "  Epochs: $EPOCHS"
     echo "  Query size: $QUERY_SIZE"
     echo "  Device: $DEVICE"
+    echo "  Number of trials: $NUM_TRIALS"
     echo "  Results directory: $RESULTS_DIR"
 }
 
@@ -67,6 +70,14 @@ while [[ $# -gt 0 ]]; do
         --no-random-baseline)
             RUN_RANDOM_BASELINE=false
             shift
+            ;;
+        --num-trials)
+            NUM_TRIALS="$2"
+            if ! [[ "$NUM_TRIALS" =~ ^[0-9]+$ ]] || [ "$NUM_TRIALS" -lt 1 ]; then
+                echo "Error: --num-trials must be a positive integer"
+                exit 1
+            fi
+            shift 2
             ;;
         --help)
             show_usage
@@ -88,7 +99,7 @@ run_single_test() {
     local test_num=$4
     local total_tests=$5
     
-    print_status $BLUE "Running test ${test_num}/${total_tests}: dataset_size=${dataset_size}, sample_size=${sample_size}, model_size=${model_size}"
+    print_status $BLUE "Running test ${test_num}/${total_tests}: dataset_size=${dataset_size}, sample_size=${sample_size}, model_size=${model_size}, trials=${NUM_TRIALS}"
     
     # Skip if sample_size > dataset_size
     if [ "$sample_size" -gt "$dataset_size" ]; then
@@ -108,18 +119,19 @@ run_single_test() {
         --epochs "$EPOCHS" \
         --device "$DEVICE" \
         --output_dir "$RESULTS_DIR" \
+        --num_trials "$NUM_TRIALS" \
         --log_level INFO; then
         
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         print_status $GREEN "  ✅ Completed in ${duration}s"
-        log_message "SUCCESS: dataset_size=$dataset_size, sample_size=$sample_size, model_size=$model_size, duration=${duration}s"
+        log_message "SUCCESS: dataset_size=$dataset_size, sample_size=$sample_size, model_size=$model_size, trials=$NUM_TRIALS, duration=${duration}s"
         return 0
     else
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
         print_status $RED "  ❌ Failed after ${duration}s"
-        log_message "FAILED: dataset_size=$dataset_size, sample_size=$sample_size, model_size=$model_size, duration=${duration}s"
+        log_message "FAILED: dataset_size=$dataset_size, sample_size=$sample_size, model_size=$model_size, trials=$NUM_TRIALS, duration=${duration}s"
         return 1
     fi
 }
@@ -135,7 +147,7 @@ run_random_baseline_tests() {
     
     for sample_size in "${baseline_sample_sizes[@]}"; do
         for model_size in "${baseline_model_sizes[@]}"; do
-            print_status $BLUE "Running random baseline test ${test_num}/${total_baseline_tests}: sample_size=${sample_size}, model_size=${model_size}"
+            print_status $BLUE "Running random baseline test ${test_num}/${total_baseline_tests}: sample_size=${sample_size}, model_size=${model_size}, trials=${NUM_TRIALS}"
             
             local start_time=$(date +%s)
             
@@ -147,18 +159,19 @@ run_random_baseline_tests() {
                 --epochs "$EPOCHS" \
                 --device "$DEVICE" \
                 --output_dir "$RESULTS_DIR" \
+                --num_trials "$NUM_TRIALS" \
                 --random_baseline \
                 --log_level INFO; then
                 
                 local end_time=$(date +%s)
                 local duration=$((end_time - start_time))
                 print_status $GREEN "  ✅ Random baseline completed in ${duration}s"
-                log_message "SUCCESS (RANDOM): sample_size=$sample_size, model_size=$model_size, duration=${duration}s"
+                log_message "SUCCESS (RANDOM): sample_size=$sample_size, model_size=$model_size, trials=$NUM_TRIALS, duration=${duration}s"
             else
                 local end_time=$(date +%s)
                 local duration=$((end_time - start_time))
                 print_status $RED "  ❌ Random baseline failed after ${duration}s"
-                log_message "FAILED (RANDOM): sample_size=$sample_size, model_size=$model_size, duration=${duration}s"
+                log_message "FAILED (RANDOM): sample_size=$sample_size, model_size=$model_size, trials=$NUM_TRIALS, duration=${duration}s"
             fi
             
             ((test_num++))
@@ -175,6 +188,7 @@ main() {
     print_status $BLUE "Epochs: $EPOCHS"
     print_status $BLUE "Query size: $QUERY_SIZE"
     print_status $BLUE "Device: $DEVICE"
+    print_status $BLUE "Number of trials per test: $NUM_TRIALS"
     print_status $BLUE "Results will be saved to: $RESULTS_DIR"
     print_status $BLUE "Log file: $LOG_FILE"
     print_status $BLUE "Run random baseline tests: $RUN_RANDOM_BASELINE"
@@ -187,7 +201,7 @@ main() {
     log_message "Dataset sizes: ${DATASET_SIZES[*]}"
     log_message "Sample sizes: ${SAMPLE_SIZES[*]}"
     log_message "Model sizes: ${MODEL_SIZES[*]}"
-    log_message "Configuration: epochs=$EPOCHS, query_size=$QUERY_SIZE, device=$DEVICE"
+    log_message "Configuration: epochs=$EPOCHS, query_size=$QUERY_SIZE, device=$DEVICE, num_trials=$NUM_TRIALS"
     log_message "Run random baseline tests: $RUN_RANDOM_BASELINE"
     
     # Calculate total number of valid tests
@@ -204,6 +218,7 @@ main() {
     done
     
     print_status $YELLOW "Total valid test combinations: $total_tests"
+    print_status $YELLOW "Each test will run $NUM_TRIALS trials for averaged results"
     
     # Run all test combinations
     local test_num=1
@@ -259,11 +274,13 @@ main() {
     print_status $GREEN "✅ Successful tests: $successful_tests"
     print_status $RED "❌ Failed tests: $failed_tests"
     print_status $YELLOW "⏭️  Skipped tests: $skipped_tests"
+    print_status $BLUE "🔄 Trials per test: $NUM_TRIALS"
     print_status $BLUE "⏱️  Total runtime: ${hours}h ${minutes}m ${seconds}s"
     
     # Log summary
     log_message "Test run completed"
     log_message "Successful: $successful_tests, Failed: $failed_tests, Skipped: $skipped_tests"
+    log_message "Trials per test: $NUM_TRIALS"
     log_message "Total runtime: ${hours}h ${minutes}m ${seconds}s"
     
     # Final message
@@ -275,6 +292,7 @@ main() {
         else
             print_status $BLUE "Full dataset tests completed (random baseline tests skipped)."
         fi
+        print_status $BLUE "Each test was run with $NUM_TRIALS trials for averaged results."
         print_status $BLUE "You can now run the plotting script:"
         print_status $BLUE "python kronfluence/experiments/01_plot_by_examples.py"
     else

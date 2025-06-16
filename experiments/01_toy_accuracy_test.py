@@ -13,6 +13,8 @@ The test compares influence scores computed with:
 - M=N samples (all training points)
 
 Accuracy is measured using MSE between M=K and M=N influence scores.
+
+Multiple trials with different random seeds can be run to get averaged results.
 """
 
 import argparse
@@ -21,7 +23,7 @@ import os
 import time
 import json
 import tempfile
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -60,6 +62,11 @@ class AccuracyTestResults:
     score_time: float
     timestamp: str
     experiment_id: str
+    # New fields for multi-trial support
+    num_trials: int = 1
+    trial_results: List[Dict[str, float]] = None  # Individual trial results
+    mse_std: float = 0.0  # Standard deviation of MSE across trials
+    spearman_std: float = 0.0  # Standard deviation of Spearman correlation across trials
 
 
 class ToyDataset(Dataset):
@@ -160,11 +167,15 @@ class ToyTask(Task):
         return self.compute_train_loss(batch, model, sample=False)
 
 
-def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 20, lr: float = 0.01, device: str = "cpu") -> None:
+def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 20, lr: float = 0.01, device: str = "cpu", seed: int = 42) -> None:
     """Train the toy model for the specified number of epochs."""
     
-    # Make training deterministic
-    torch.manual_seed(42)
+    # Make training deterministic with provided seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     
     # Move model to device
     model = model.to(device)
@@ -174,7 +185,6 @@ def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 20, lr: fl
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     model.train()
-    print(f"Training model for {epochs} epochs...")
     
     for epoch in range(epochs):
         total_loss = 0.0
@@ -189,10 +199,6 @@ def train_toy_model(model: nn.Module, dataset: Dataset, epochs: int = 20, lr: fl
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            avg_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch:2d}/{epochs}: Loss = {avg_loss:.6f}")
 
 
 def compute_influence_scores_with_sample_size(
@@ -202,7 +208,9 @@ def compute_influence_scores_with_sample_size(
     query_dataset: Dataset,
     sample_size: int,
     analysis_name: str,
-    device: str = "cpu"
+    device: str = "cpu",
+    seed: int = 42,
+    output_dir: str = RESULTS_DIR
 ) -> Tuple[torch.Tensor, float, float]:
     """
     Compute influence scores using a specific sample size for factor computation.
@@ -211,20 +219,18 @@ def compute_influence_scores_with_sample_size(
         Tuple of (influence_scores, factor_time, score_time)
     """
     
-    print(f"Computing influence scores with sample_size={sample_size}")
-    
     # Set seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         # Ensure deterministic CUDA operations
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     
-    # Create output directory for this analysis
-    analysis_output_dir = os.path.join(RESULTS_DIR, analysis_name)
+    # Create output directory for this analysis within the experiment directory
+    analysis_output_dir = os.path.join(output_dir, "analysis", analysis_name)
     os.makedirs(analysis_output_dir, exist_ok=True)
     
     # Create analyzer
@@ -274,6 +280,72 @@ def compute_influence_scores_with_sample_size(
     return scores, factor_time, score_time
 
 
+def run_single_trial(
+    dataset_size: int,
+    query_size: int,
+    m_test: int,
+    epochs: int,
+    model_size: int,
+    device: str,
+    use_random_baseline: bool,
+    trial_seed: int,
+    trial_num: int,
+    total_trials: int,
+    output_dir: str = RESULTS_DIR
+) -> Dict[str, float]:
+    """
+    Run a single trial with a specific seed and return the results.
+    """
+    
+    print(f"  Trial {trial_num}/{total_trials} (seed={trial_seed})")
+    
+    # Create datasets with trial-specific seeds
+    train_dataset = ToyDataset(num_samples=dataset_size, input_dim=10, seed=trial_seed)
+    query_dataset = ToyDataset(num_samples=query_size, input_dim=10, seed=trial_seed + 1000)
+    
+    # Create and train model
+    model = ToyModel(input_dim=10, target_params=model_size)
+    train_toy_model(model, train_dataset, epochs=epochs, device=device, seed=trial_seed + 2000)
+    
+    # Prepare model for analysis
+    task = ToyTask()
+    model = prepare_model(model, task)
+    
+    # Compute influence scores with different sample sizes
+    scores_test, factor_time_test, _ = compute_influence_scores_with_sample_size(
+        model, task, train_dataset, query_dataset, m_test, 
+        f"analysis_test_trial_{trial_num}", device, seed=trial_seed + 3000, output_dir=output_dir
+    )
+    
+    if use_random_baseline:
+        # Generate random scores with same shape as test scores
+        np.random.seed(trial_seed + 4000)
+        scores_baseline = torch.from_numpy(np.random.randn(*scores_test.shape)).to(scores_test.device).to(scores_test.dtype)
+        factor_time_full = 0.0
+        score_time = 0.0
+    else:
+        scores_baseline, factor_time_full, score_time = compute_influence_scores_with_sample_size(
+            model, task, train_dataset, query_dataset, dataset_size, 
+            f"analysis_full_trial_{trial_num}", device, seed=trial_seed + 5000, output_dir=output_dir
+        )
+    
+    # Calculate metrics for this trial
+    mse_test_vs_full = F.mse_loss(scores_test, scores_baseline).item()
+    
+    scores_test_flat = scores_test.flatten().cpu().numpy()
+    scores_baseline_flat = scores_baseline.flatten().cpu().numpy()
+    spearman_corr, spearman_p = spearmanr(scores_test_flat, scores_baseline_flat)
+    
+    return {
+        'mse': mse_test_vs_full,
+        'spearman_correlation': spearman_corr,
+        'spearman_pvalue': spearman_p,
+        'factor_time_test': factor_time_test,
+        'factor_time_full': factor_time_full,
+        'score_time': score_time
+    }
+
+
 def run_accuracy_test(
     dataset_size: int = 1000,
     query_size: int = 50,
@@ -283,10 +355,12 @@ def run_accuracy_test(
     device: str = "cpu",
     save_results: bool = True,
     use_random_baseline: bool = False,
-    output_dir: str = RESULTS_DIR
+    output_dir: str = RESULTS_DIR,
+    num_trials: int = 1
 ) -> AccuracyTestResults:
     """
     Run the complete accuracy test comparing influence scores with different sample sizes.
+    Supports multiple trials with different random seeds for more robust results.
     """
     
     print("="*80)
@@ -295,6 +369,7 @@ def run_accuracy_test(
     print(f"Dataset size: {dataset_size}")
     print(f"Query size: {query_size}")
     print(f"Model size target: ~{model_size} parameters")
+    print(f"Number of trials: {num_trials}")
     
     if use_random_baseline:
         print(f"Baseline: M={m_test} vs Random Matrix")
@@ -306,69 +381,54 @@ def run_accuracy_test(
     print(f"Device: {device}")
     print()
     
-    # Create datasets
-    train_dataset = ToyDataset(num_samples=dataset_size, input_dim=10, seed=42)
-    query_dataset = ToyDataset(num_samples=query_size, input_dim=10, seed=123)  # Different seed for queries
+    # Run multiple trials
+    trial_results = []
+    base_seed = 42
     
-    # Create and train model with specified target parameter count
-    model = ToyModel(input_dim=10, target_params=model_size)
-    param_count = model.count_parameters()
-    print(f"Model has {param_count:,} parameters (target: {model_size:,})")
+    print(f"Running {num_trials} trial(s)...")
     
-    train_toy_model(model, train_dataset, epochs=epochs, device=device)
-    print()
-    
-    # Prepare model for analysis
-    task = ToyTask()
-    model = prepare_model(model, task)
-    
-    # Compute influence scores with different sample sizes
-    print("Computing influence scores...")
-    print()
-    
-    # M = K (test value)
-    scores_test, factor_time_test, _ = compute_influence_scores_with_sample_size(
-        model, task, train_dataset, query_dataset, m_test, "analysis_test", device
-    )
-    
-    if use_random_baseline:
-        # Generate random scores with same shape as test scores
-        print("Generating random baseline scores...")
-        np.random.seed(999)  # Different seed for random baseline
-        scores_baseline = torch.from_numpy(np.random.randn(*scores_test.shape)).to(scores_test.device).to(scores_test.dtype)
-        factor_time_full = 0.0  # No computation time for random
-        score_time = 0.0
-        baseline_type = "random"
-        m_full_display = "random"
-    else:
-        # M = N (full dataset)
-        scores_baseline, factor_time_full, score_time = compute_influence_scores_with_sample_size(
-            model, task, train_dataset, query_dataset, dataset_size, "analysis_full", device
+    for trial_num in range(1, num_trials + 1):
+        trial_seed = base_seed + trial_num * 10000  # Ensure seeds are well separated
+        
+        trial_result = run_single_trial(
+            dataset_size=dataset_size,
+            query_size=query_size,
+            m_test=m_test,
+            epochs=epochs,
+            model_size=model_size,
+            device=device,
+            use_random_baseline=use_random_baseline,
+            trial_seed=trial_seed,
+            trial_num=trial_num,
+            total_trials=num_trials,
+            output_dir=output_dir
         )
-        baseline_type = "full_dataset"
-        m_full_display = dataset_size
+        
+        trial_results.append(trial_result)
+        print(f"    MSE: {trial_result['mse']:.8f}, Spearman: {trial_result['spearman_correlation']:.6f}")
     
-    # Calculate MSE and correlation
-    mse_test_vs_full = F.mse_loss(scores_test, scores_baseline).item()
+    print()
     
-    # Calculate Spearman correlation (rank-based)
-    scores_test_flat = scores_test.flatten().cpu().numpy()
-    scores_baseline_flat = scores_baseline.flatten().cpu().numpy()
-    spearman_corr, spearman_p = spearmanr(scores_test_flat, scores_baseline_flat)
+    # Calculate averaged results
+    mse_values = [r['mse'] for r in trial_results]
+    spearman_values = [r['spearman_correlation'] for r in trial_results]
+    spearman_p_values = [r['spearman_pvalue'] for r in trial_results]
+    factor_time_test_values = [r['factor_time_test'] for r in trial_results]
+    factor_time_full_values = [r['factor_time_full'] for r in trial_results]
+    score_time_values = [r['score_time'] for r in trial_results]
     
-    # Sanity checks
-    if not use_random_baseline and m_test == dataset_size:
-        print(f"SANITY CHECK (M_test = M_full = {dataset_size}):")
-        print(f"  MSE = {mse_test_vs_full:.10f} (should be ≈ 0)")
-        print(f"  Spearman correlation = {spearman_corr:.10f} (should be ≈ 1)")
-        if mse_test_vs_full > 1e-6 or spearman_corr < 0.999999:
-            print(f"  WARNING: Non-deterministic behavior detected!")
-        print()
-    elif use_random_baseline:
-        print(f"RANDOM BASELINE CHECK:")
-        print(f"  Spearman correlation = {spearman_corr:.6f} (should be ≈ 0)")
-        print(f"  This gives you a sense of what 'no correlation' looks like")
-        print()
+    avg_mse = np.mean(mse_values)
+    std_mse = np.std(mse_values) if num_trials > 1 else 0.0
+    avg_spearman = np.mean(spearman_values)
+    std_spearman = np.std(spearman_values) if num_trials > 1 else 0.0
+    avg_spearman_p = np.mean(spearman_p_values)
+    avg_factor_time_test = np.mean(factor_time_test_values)
+    avg_factor_time_full = np.mean(factor_time_full_values)
+    avg_score_time = np.mean(score_time_values)
+    
+    # Get model parameter count (should be same across trials)
+    temp_model = ToyModel(input_dim=10, target_params=model_size)
+    param_count = temp_model.count_parameters()
     
     # Create results
     results = AccuracyTestResults(
@@ -378,16 +438,20 @@ def run_accuracy_test(
         query_size=query_size,
         epochs=epochs,
         m_test=m_test,
-        m_full=dataset_size if not use_random_baseline else -1,  # -1 indicates random
-        mse_test_vs_full=mse_test_vs_full,
-        spearman_correlation=spearman_corr,
-        spearman_pvalue=spearman_p,
-        baseline_type=baseline_type,
-        factor_time_test=factor_time_test,
-        factor_time_full=factor_time_full,
-        score_time=score_time,
+        m_full=dataset_size if not use_random_baseline else -1,
+        mse_test_vs_full=avg_mse,
+        spearman_correlation=avg_spearman,
+        spearman_pvalue=avg_spearman_p,
+        baseline_type="random" if use_random_baseline else "full_dataset",
+        factor_time_test=avg_factor_time_test,
+        factor_time_full=avg_factor_time_full,
+        score_time=avg_score_time,
         timestamp=datetime.now().isoformat(),
-        experiment_id=f"accuracy_test_m{m_test}_vs_{m_full_display}_{int(time.time())}"
+        experiment_id=f"accuracy_test_m{m_test}_vs_{dataset_size if not use_random_baseline else 'random'}_{int(time.time())}",
+        num_trials=num_trials,
+        trial_results=trial_results,
+        mse_std=std_mse,
+        spearman_std=std_spearman
     )
     
     # Print results
@@ -399,13 +463,18 @@ def run_accuracy_test(
     print(f"Dataset size: {results.dataset_size:,}")
     print(f"Query size: {results.query_size:,}")
     print(f"Training epochs: {results.epochs}")
+    print(f"Number of trials: {results.num_trials}")
     print()
     print("Comparison:")
     print(f"  Test M = {results.m_test}")
-    print(f"  Baseline = {m_full_display}")
+    print(f"  Baseline = {'random' if use_random_baseline else dataset_size}")
     print(f"  Baseline type = {results.baseline_type}")
     print()
-    print("Accuracy Metrics:")
+    print("Accuracy Metrics (averaged across trials):")
+    if num_trials > 1:
+        print(f"  MSE: {results.mse_test_vs_full:.8f} ± {results.mse_std:.8f}")
+        print(f"  Spearman Correlation: {results.spearman_correlation:.6f} ± {results.spearman_std:.6f} (p={results.spearman_pvalue:.2e})")
+    else:
     print(f"  MSE: {results.mse_test_vs_full:.8f}")
     print(f"  Spearman Correlation: {results.spearman_correlation:.6f} (p={results.spearman_pvalue:.2e})")
     print()
@@ -425,10 +494,10 @@ def run_accuracy_test(
         else:
             print("  ❌ Poor rank correlation - ranking preservation is weak")
     print()
-    print("Timing:")
+    print("Timing (averaged across trials):")
     print(f"  Factor computation time (M={results.m_test}): {results.factor_time_test:.2f}s") 
     if not use_random_baseline:
-        print(f"  Factor computation time (M={m_full_display}): {results.factor_time_full:.2f}s")
+        print(f"  Factor computation time (M={dataset_size}): {results.factor_time_full:.2f}s")
         print(f"  Score computation time: {results.score_time:.2f}s")
     print()
     print("="*80)
@@ -531,6 +600,13 @@ def main():
         help=f"Directory to save results (default: {RESULTS_DIR})"
     )
     
+    parser.add_argument(
+        "--num_trials",
+        type=int,
+        default=1,
+        help="Number of trials to run with different random seeds (default: 1)"
+    )
+    
     args = parser.parse_args()
     
     # Set up logging
@@ -547,6 +623,9 @@ def main():
         print("WARNING: CUDA requested but not available, falling back to CPU")
         args.device = "cpu"
     
+    if args.num_trials < 1:
+        raise ValueError(f"num_trials must be at least 1, got {args.num_trials}")
+    
     # Run the accuracy test
     results = run_accuracy_test(
         dataset_size=args.dataset_size,
@@ -557,7 +636,8 @@ def main():
         device=args.device,
         save_results=not args.no_save,
         use_random_baseline=args.random_baseline,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        num_trials=args.num_trials
     )
     
     return results

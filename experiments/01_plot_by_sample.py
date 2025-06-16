@@ -126,6 +126,21 @@ def create_plots(plot_data: PlotData, output_dir: str) -> None:
     # Filter for full dataset baseline results only
     full_data = df[df['baseline_type'] == 'full_dataset']
     
+    # Get the training dataset size (should be consistent across all experiments)
+    if not full_data.empty:
+        training_data_size = full_data['dataset_size'].iloc[0]
+        query_size = full_data['query_size'].iloc[0]
+        
+        # Check if all dataset sizes are the same
+        if not all(size == training_data_size for size in full_data['dataset_size']):
+            print("Warning: Multiple training dataset sizes found in the data")
+            training_data_size_str = f"{full_data['dataset_size'].min():,} - {full_data['dataset_size'].max():,}"
+        else:
+            training_data_size_str = f"{training_data_size:,}"
+    else:
+        training_data_size_str = "Unknown"
+        query_size = "Unknown"
+    
     # Set up the plotting style
     plt.style.use('default')
     plt.rcParams['figure.figsize'] = (12, 5)
@@ -133,7 +148,8 @@ def create_plots(plot_data: PlotData, output_dir: str) -> None:
     
     # Create figure with 1x2 subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle('Kronfluence Accuracy Test Results by Sample Size', fontsize=16, fontweight='bold')
+    fig.suptitle(f'Kronfluence Accuracy Test Results by Sample Size\n(Training Data: {training_data_size_str} examples, Query Data: {query_size} examples)', 
+                 fontsize=14, fontweight='bold')
     
     # Plot 1: MSE vs m_test (full dataset baseline)
     if not full_data.empty:
@@ -141,7 +157,7 @@ def create_plots(plot_data: PlotData, output_dir: str) -> None:
                    c='blue', alpha=0.7, s=60)
         ax1.set_xlabel('Sample Size (m_test)')
         ax1.set_ylabel('MSE')
-        ax1.set_title('MSE vs Sample Size')
+        ax1.set_title(f'MSE vs Sample Size\n(Training Data: {training_data_size_str} examples)')
         ax1.set_yscale('log')  # Log scale for MSE since it can vary widely
         ax1.grid(True, alpha=0.3)
     
@@ -151,7 +167,7 @@ def create_plots(plot_data: PlotData, output_dir: str) -> None:
                    c='green', alpha=0.7, s=60)
         ax2.set_xlabel('Sample Size (m_test)')
         ax2.set_ylabel('Spearman Correlation')
-        ax2.set_title('Spearman Correlation vs Sample Size')
+        ax2.set_title(f'Spearman Correlation vs Sample Size\n(Training Data: {training_data_size_str} examples)')
         ax2.set_ylim(0, 1)
         ax2.grid(True, alpha=0.3)
     
@@ -208,14 +224,14 @@ def main():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/share/u/yu.stev/influence/kronfluence/data/accuracy",
+        default="/share/u/yu.stev/influence/kronfluence/data/accuracy/experiment4",
         help="Directory containing JSON result files"
     )
     
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/share/u/yu.stev/influence/kronfluence/plots/accuracy",
+        default="/share/u/yu.stev/influence/kronfluence/plots/accuracy/04-sample-size-big",
         help="Directory to save plots"
     )
     
